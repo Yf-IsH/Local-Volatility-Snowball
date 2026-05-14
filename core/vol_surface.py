@@ -2,42 +2,68 @@ import numpy as np
 from scipy.interpolate import RectBivariateSpline
 from scipy.stats import norm
 
+
 class VolSurface:
+    """Smooth implied-volatility surface on strike and maturity grids."""
+
     def __init__(self, strikes, maturities, iv_matrix):
-        """
-        初始化隐含波动率(IV)曲面
-        :param strikes: 1D array, 行权价网格 (K)
-        :param maturities: 1D array, 到期时间网格 (T)
-        :param iv_matrix: 2D array, 对应的隐含波动率矩阵, shape = (len(strikes), len(maturities))
-        """
-        self.K_grid = strikes
-        self.T_grid = maturities
-        
-        # 老师敲黑板：这里我们用双变量样条插值(Bivariate Spline)。
-        # 几何意义：在给定的 (K, T) 离散点上，拉伸一张平滑且连续的二维曲面。
-        # 这样我们在任意非节点的 (K, T) 处，都能取到平滑的波动率。
-        self.spline = RectBivariateSpline(self.K_grid, self.T_grid, iv_matrix)
+        self.K_grid = np.asarray(strikes, dtype=float)
+        self.T_grid = np.asarray(maturities, dtype=float)
+        self.iv_matrix = np.asarray(iv_matrix, dtype=float)
+
+        if self.iv_matrix.shape != (len(self.K_grid), len(self.T_grid)):
+            raise ValueError("iv_matrix must have shape (len(strikes), len(maturities))")
+        if np.any(np.diff(self.K_grid) <= 0) or np.any(np.diff(self.T_grid) <= 0):
+            raise ValueError("strikes and maturities must be strictly increasing")
+        if np.any(self.iv_matrix <= 0):
+            raise ValueError("all implied volatilities must be positive")
+
+        kx = min(3, len(self.K_grid) - 1)
+        ky = min(3, len(self.T_grid) - 1)
+        self.spline = RectBivariateSpline(self.K_grid, self.T_grid, self.iv_matrix, kx=kx, ky=ky)
+
+    @property
+    def min_strike(self):
+        return float(self.K_grid[0])
+
+    @property
+    def max_strike(self):
+        return float(self.K_grid[-1])
+
+    @property
+    def min_maturity(self):
+        return float(self.T_grid[0])
+
+    @property
+    def max_maturity(self):
+        return float(self.T_grid[-1])
 
     def get_iv(self, K, T):
-        """
-        获取任意给定 K 和 T 处的平滑隐含波动率
-        """
-        # 注意：RectBivariateSpline 返回的是二维数组，我们需要用 [0,0] 提取标量
-        return self.spline(K, T)[0, 0]
+        """Return interpolated implied volatility, clamped to the calibrated grid."""
+        K_eval = np.clip(float(K), self.min_strike, self.max_strike)
+        T_eval = np.clip(float(T), self.min_maturity, self.max_maturity)
+        return max(float(self.spline(K_eval, T_eval)[0, 0]), 1e-8)
 
-    def black_scholes_call(self, S, K, T, r, q=0):
-        """
-        根据平滑后的 IV 曲面，反算 Black-Scholes 看涨期权价格
-        几何意义：我们用平滑的“橡胶皮”重新生成了毫无噪音的理论期权价格表面
-        """
-        # 如果时间 T 极小，期权价格趋近于内在价值
-        if T <= 1e-5:
+    def black_scholes_call(self, S, K, T, r, q=0.0):
+        """Black-Scholes call price using the interpolated implied volatility."""
+        S = float(S)
+        K = float(K)
+        T = float(T)
+        r = float(r)
+        q = float(q)
+
+        if T <= 1e-8:
             return max(S - K, 0.0)
-            
+
         sigma = self.get_iv(K, T)
-        
-        d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-        d2 = d1 - sigma * np.sqrt(T)
-        
-        call_price = S * np.exp(-q * T) * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
-        return call_price
+        sqrt_t = np.sqrt(T)
+        d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * sqrt_t)
+        d2 = d1 - sigma * sqrt_t
+        return float(S * np.exp(-q * T) * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2))
+
+    def black_scholes_put(self, S, K, T, r, q=0.0):
+        """Black-Scholes put price using call-put parity."""
+        call = self.black_scholes_call(S, K, T, r, q)
+        if T <= 1e-8:
+            return max(K - S, 0.0)
+        return float(call - S * np.exp(-q * T) + K * np.exp(-r * T))

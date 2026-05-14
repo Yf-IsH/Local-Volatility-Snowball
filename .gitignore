@@ -9,3 +9,5 @@ build/
 .venv/
 .pytest_cache/
 *.egg
+data/cache/
+notebooks/
