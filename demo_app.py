@@ -43,12 +43,19 @@ def surface_payload(surface, lv):
     }
 
 
-HTML = """<!doctype html>
+HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Local Vol Snowball Coupon Demo</title>
+  <script>
+    window.MathJax = {
+      tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] },
+      svg: { fontCache: 'global' }
+    };
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
   <style>
     :root { color-scheme: light; --ink: #172026; --muted: #66727c; --line: #d9e0e6; --fill: #f5f7f9; --brand: #116a7b; --soft: #eef6f7; --warn: #c75146; }
     * { box-sizing: border-box; }
@@ -86,7 +93,7 @@ HTML = """<!doctype html>
     .formula-toggle { margin-top: 12px; border: 1px solid var(--brand); background: #fff; color: var(--brand); }
     .derivation { display: none; margin-top: 14px; padding: 14px; border: 1px solid var(--line); border-radius: 8px; background: #fbfcfd; }
     .derivation.open { display: block; }
-    .math { overflow-x: auto; padding: 10px 12px; margin: 8px 0; border: 1px solid var(--line); border-radius: 6px; background: #fff; font-family: Cambria Math, "Times New Roman", serif; font-size: 15px; white-space: nowrap; }
+    .math { overflow-x: auto; padding: 10px 12px; margin: 8px 0; border: 1px solid var(--line); border-radius: 6px; background: #fff; font-size: 15px; }
     .derivation p { margin: 8px 0; }
     .note { color: var(--muted); font-size: 12px; line-height: 1.6; padding: 12px 16px; background: var(--fill); border-top: 1px solid var(--line); }
     .status { font-size: 13px; color: var(--muted); min-height: 20px; }
@@ -135,6 +142,32 @@ HTML = """<!doctype html>
       <label>敲入水平 S0倍数
         <input id="ki" type="number" value="0.75" step="0.01" min="0.3" max="1">
       </label>
+      <label>锁定期 月
+        <input id="lockout" type="number" value="0" step="1" min="0" max="24">
+      </label>
+      <label>敲入观察频率
+        <select id="kiObs">
+          <option value="daily">每日</option>
+          <option value="maturity">仅期末 欧式</option>
+        </select>
+      </label>
+      <label>敲出观察频率
+        <select id="koObs">
+          <option value="monthly">每月</option>
+          <option value="daily">每日</option>
+          <option value="quarterly">每季度</option>
+          <option value="maturity">仅期末</option>
+        </select>
+      </label>
+      <label>是否降敲
+        <select id="stepDownEnabled">
+          <option value="false">否</option>
+          <option value="true">是</option>
+        </select>
+      </label>
+      <label>降敲幅度 每次观察
+        <input id="stepDown" type="number" value="0.005" step="0.001" min="0" max="0.1">
+      </label>
       <label>模拟路径
         <input id="paths" type="number" value="5000" step="1000" min="1000" max="30000">
       </label>
@@ -154,22 +187,94 @@ HTML = """<!doctype html>
         <div>ETF 标的会优先使用上交所真实期权风险指标里的 <code>IMPLC_VOLATLTY</code> 构建 IV 曲面；指数标的暂时仍使用历史波动率演示曲面。</div>
         <button class="formula-toggle" id="formulaToggle" type="button">查看详细数学推导</button>
         <div class="derivation" id="derivation">
-          <p><strong>1. 风险中性标的过程</strong></p>
-          <div class="math">dS_t / S_t = (r - q) dt + σ_loc(S_t,t) dW_t^Q</div>
-          <p>其中 <code>r</code> 是无风险利率，<code>q</code> 是连续分红率或持有成本近似，<code>σ_loc(S,t)</code> 是局部波动率。它不是一个常数，而是随价格位置和时间变化的函数。</p>
-          <p><strong>2. 从 IV 曲面到期权价格曲面</strong></p>
-          <div class="math">C(K,T) = BSCall(S0, K, T, r, q, IV(K,T))</div>
-          <p>交易所或市场报价给出不同执行价和到期日的隐含波动率 <code>IV(K,T)</code>。先把它转换成欧式看涨期权价格曲面 <code>C(K,T)</code>。</p>
-          <p><strong>3. Dupire 局部波动率公式</strong></p>
-          <div class="math">σ_loc²(K,T) = [∂C/∂T + qC + (r-q)K∂C/∂K] / [0.5 K² ∂²C/∂K²]</div>
-          <p>这一步把 vanilla option 的市场曲面转换成 local volatility surface。直觉上，期权价格随期限的变化提供“时间方向”的信息，随行权价的一阶和二阶变化提供“分布形状/密度”的信息。</p>
-          <p><strong>4. 用 local vol 模拟雪球路径</strong></p>
-          <div class="math">S_{t+Δt} = S_t exp((r-q-0.5σ_loc²)Δt + σ_loc sqrt(Δt)Z)</div>
-          <p>每条路径按每日步长演化，并检查敲入线、观察日敲出线和到期现金流。</p>
-          <p><strong>5. 公允票息反解</strong></p>
-          <div class="math">PV(c) = E[Dτ · PrincipalPayoff] + c · E[Dτ · Accrual]</div>
-          <div class="math">c_fair = (Notional - PV_principal) / PV_coupon_annuity</div>
-          <p>所以票息不是模型直接“猜”的，而是在同一批路径上拆成本金腿和票息年金腿，再令理论价值等于名义本金反解出来。</p>
+          <p><strong>1. 从市场期权价格得到隐含波动率曲面</strong></p>
+          <p>市场上每个到期日 \(T\) 和执行价 \(K\) 的 vanilla option 都有价格。把这些价格代入 Black-Scholes 反解，就得到隐含波动率曲面 \(\sigma_{\mathrm{imp}}(K,T)\)。它不是历史波动率，而是市场今天对未来分布的定价。</p>
+          <div class="math">\[
+            C^{\mathrm{mkt}}(K,T)
+            =
+            BSCall\!\left(S_0,K,T,r,q,\sigma_{\mathrm{imp}}(K,T)\right)
+          \]</div>
+          <p>ETF 模式下，本 demo 使用上交所风险指标中的 <code>IMPLC_VOLATLTY</code> 作为 \(\sigma_{\mathrm{imp}}\) 的市场输入，并把离散合约点插值成规则曲面。</p>
+
+          <p><strong>2. Local volatility 假设</strong></p>
+          <p>Black-Scholes 使用一个常数波动率，而 local volatility 允许瞬时波动率随价格和时间变化。在风险中性测度 \(\mathbb Q\) 下，标的过程写成：</p>
+          <div class="math">\[
+            \frac{dS_t}{S_t}
+            = (r-q)\,dt + \sigma_{\mathrm{loc}}(S_t,t)\,dW_t^{\mathbb Q}
+          \]</div>
+          <p>这里 \(\sigma_{\mathrm{loc}}(S,t)\) 的目标不是预测真实波动率，而是在风险中性定价框架下复现市场 vanilla option 曲面。</p>
+
+          <p><strong>3. Dupire 公式：从价格曲面到局部波动率曲面</strong></p>
+          <p>把隐含波动率曲面转成欧式看涨期权价格曲面 \(C(K,T)\) 后，可以用 Dupire 公式得到局部波动率：</p>
+          <div class="math">\[
+            \sigma_{\mathrm{loc}}^2(K,T)
+            =
+            \frac{
+              \frac{\partial C}{\partial T}
+              + qC
+              + (r-q)K\frac{\partial C}{\partial K}
+            }{
+              \frac{1}{2}K^2\frac{\partial^2 C}{\partial K^2}
+            }
+          \]</div>
+          <p>直觉上，\(\partial C/\partial T\) 描述期限方向的价格变化，\(\partial C/\partial K\) 和 \(\partial^2 C/\partial K^2\) 描述执行价方向的曲率和隐含分布。实际代码里会先平滑曲面，再用有限差分近似这些偏导。</p>
+
+          <p><strong>4. 用 local volatility 生成风险中性路径</strong></p>
+          <p>拿到 \(\sigma_{\mathrm{loc}}\) 后，用 Euler/log-Euler 方式离散模拟路径：</p>
+          <div class="math">\[
+            S_{t+\Delta t}
+            =
+            S_t\exp\!\left(
+              (r-q-\tfrac{1}{2}\sigma_{\mathrm{loc}}^2)\Delta t
+              + \sigma_{\mathrm{loc}}\sqrt{\Delta t}\,Z
+            \right),
+            \quad Z\sim N(0,1)
+          \]</div>
+          <p>每条路径都会按照用户选择的雪球条款检查敲入、敲出、锁定期和降敲。观察频率越高，触发机会越多；锁定期会推迟可敲出时间；降敲会让后续敲出线逐步降低。</p>
+
+          <p><strong>5. 四类互斥路径</strong></p>
+          <p>为了理解风险，最终路径分成四类，并且概率总和为 1：</p>
+          <div class="math">\[
+            P_{\mathrm{bonus}}
+            + P_{\mathrm{noKI,KO}}
+            + P_{\mathrm{KI,noKO}}
+            + P_{\mathrm{KI,KO}}
+            = 1
+          \]</div>
+          <p>\(P_{\mathrm{bonus}}\) 是未敲入且未敲出，也就是持有到期获得票息且没有本金亏损的路径占比。</p>
+
+          <p><strong>6. 公允票息的数学定义</strong></p>
+          <p>令年化票息为 \(c\)，每条路径对应一个贴现后的总现金流 \(X_i(c)\)。公允票息定义为使产品理论现值等于名义本金的 \(c\)：</p>
+          <div class="math">\[
+            PV(c)
+            =
+            \mathbb E^{\mathbb Q}\!\left[X(c)\right]
+            =
+            \mathrm{Notional}
+          \]</div>
+          <p>在 Monte Carlo 中，用 \(N\) 条路径近似这个期望：</p>
+          <div class="math">\[
+            PV(c)
+            \approx
+            \frac{1}{N}\sum_{i=1}^{N}X_i(c)
+          \]</div>
+          <p>由于雪球票息现金流对 \(c\) 是线性的，可以把路径现金流写成：</p>
+          <div class="math">\[
+            X_i(c)=A_i+cB_i
+          \]</div>
+          <p>其中 \(A_i\) 是路径中与票息无关的贴现现金流，\(B_i\) 是该路径对单位年化票息的贴现敏感度。因此：</p>
+          <div class="math">\[
+            c_{\mathrm{fair}}
+            =
+            \frac{
+              \mathrm{Notional}
+              -
+              \frac{1}{N}\sum_{i=1}^{N}A_i
+            }{
+              \frac{1}{N}\sum_{i=1}^{N}B_i
+            }
+          \]</div>
+          <p>这就是页面中“公允年化票息”的来源：不是手动调参，也不是历史收益率，而是在 local volatility 风险中性路径下让理论价值等于名义本金的解。</p>
         </div>
       </section>
       <section class="panel chart-wrap">
@@ -206,6 +311,12 @@ HTML = """<!doctype html>
 
     function fmtMoney(x) { return Number(x).toLocaleString('zh-CN', { maximumFractionDigits: 0 }); }
     function fmtPct(x) { return (Number(x) * 100).toFixed(2) + '%'; }
+    function fmtAxis(x) {
+      const v = Math.abs(Number(x));
+      if (v < 10) return Number(x).toFixed(3);
+      if (v < 100) return Number(x).toFixed(2);
+      return Number(x).toFixed(0);
+    }
     function metric(label, value, primary=false) { return `<div class="metric ${primary ? 'primary' : ''}"><span>${label}</span><strong>${value}</strong></div>`; }
 
     async function run() {
@@ -218,6 +329,11 @@ HTML = """<!doctype html>
         coupon: $('coupon').value,
         ko: $('ko').value,
         ki: $('ki').value,
+        lockout: $('lockout').value,
+        ki_obs: $('kiObs').value,
+        ko_obs: $('koObs').value,
+        step_down_enabled: $('stepDownEnabled').value,
+        step_down: $('stepDown').value,
         paths: $('paths').value,
       });
       try {
@@ -235,21 +351,19 @@ HTML = """<!doctype html>
           ['行情日期', data.asof],
           ['IV曲面来源', data.iv_source],
           ['IV曲面日期', data.iv_asof],
-          ['IV有效点数', data.iv_points],
-          ['历史年化波动率', fmtPct(data.annual_vol)],
+          ['历史年化波动率', data.uses_real_iv ? '真实IV模式未用于定价' : fmtPct(data.annual_vol)],
           ['手动报价票息', fmtPct(data.quoted_coupon)],
+          ['锁定期', data.terms.lockout_months + ' 月'],
+          ['敲入观察', data.terms.knock_in_observation],
+          ['敲出观察', data.terms.knock_out_observation],
+          ['降敲', data.terms.step_down_enabled ? ('是，每次 ' + fmtPct(data.terms.step_down)) : '否'],
           ['公允票息下PV', fmtMoney(data.par_price)],
-          ['本金腿PV', fmtMoney(data.principal_pv)],
-          ['票息年金腿PV 每100%票息', fmtMoney(data.coupon_annuity_pv)],
-          ['欧式ATM Call校验价', data.european_call.toFixed(4)],
           ['ATM局部波动率', fmtPct(data.atm_local_vol)],
           ['红利概率：未敲入未敲出', fmtPct(data.bonus_probability)],
           ['未敲入后敲出', fmtPct(data.no_ki_ko_probability)],
           ['敲入未敲出', fmtPct(data.ki_no_ko_probability)],
           ['敲入后敲出', fmtPct(data.ki_ko_probability)],
           ['四类概率合计', fmtPct(data.probability_total)],
-          ['曾敲出概率', fmtPct(data.ko_probability)],
-          ['曾敲入概率', fmtPct(data.ki_probability)],
           ['平均敲出时间', data.avg_ko_time ? data.avg_ko_time.toFixed(3) + ' 年' : '-'],
           ['蒙特卡洛标准误', fmtMoney(data.std_error)],
         ].map(([k,v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
@@ -270,6 +384,9 @@ HTML = """<!doctype html>
       const panel = $('derivation');
       panel.classList.toggle('open');
       $('formulaToggle').textContent = panel.classList.contains('open') ? '收起数学推导' : '查看详细数学推导';
+      if (panel.classList.contains('open') && window.MathJax && window.MathJax.typesetPromise) {
+        window.MathJax.typesetPromise([panel]);
+      }
     });
     window.addEventListener('resize', drawAll);
     for (const id of Object.keys(surfaceViews)) bindSurfaceInteraction(id);
@@ -313,7 +430,7 @@ HTML = """<!doctype html>
         const yy = pad.top + ih * i / 4;
         const val = max - (max - min) * i / 4;
         ctx.beginPath(); ctx.moveTo(pad.left, yy); ctx.lineTo(w - pad.right, yy); ctx.stroke();
-        ctx.fillText(val.toFixed(0), 8, yy + 4);
+        ctx.fillText(fmtAxis(val), 8, yy + 4);
       }
       const grad = ctx.createLinearGradient(0, pad.top, 0, h - pad.bottom);
       grad.addColorStop(0, 'rgba(17,106,123,.24)');
@@ -595,6 +712,16 @@ def _int(qs, key, default):
     return int(float(qs.get(key, [default])[0]))
 
 
+def _bool(qs, key, default=False):
+    value = str(qs.get(key, [str(default).lower()])[0]).lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _choice(qs, key, default, allowed):
+    value = str(qs.get(key, [default])[0]).lower()
+    return value if value in allowed else default
+
+
 class DemoHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -634,6 +761,7 @@ class DemoHandler(BaseHTTPRequestHandler):
         iv_source = "历史实现波动率生成的演示 IV 曲面"
         iv_asof = snapshot.asof
         iv_points = "demo"
+        uses_real_iv = False
         if index_key in ETF_OPTION_UNIVERSE:
             try:
                 option_surface = load_sse_option_iv_surface(index_key, snapshot.spot)
@@ -641,6 +769,7 @@ class DemoHandler(BaseHTTPRequestHandler):
                 iv_source = option_surface.source
                 iv_asof = option_surface.asof
                 iv_points = f"{option_surface.filtered_points}/{option_surface.raw_points}"
+                uses_real_iv = True
             except Exception as exc:
                 surface = build_demo_iv_surface(snapshot.spot, snapshot.annual_vol)
                 iv_source = f"真实 IV 加载失败，已退回演示曲面：{exc}"
@@ -653,6 +782,11 @@ class DemoHandler(BaseHTTPRequestHandler):
             coupon=_float(qs, "coupon", 0.16),
             knock_out=_float(qs, "ko", 1.03),
             knock_in=_float(qs, "ki", 0.75),
+            lockout_months=_int(qs, "lockout", 0),
+            knock_in_observation=_choice(qs, "ki_obs", "daily", {"daily", "maturity"}),
+            knock_out_observation=_choice(qs, "ko_obs", "monthly", {"daily", "monthly", "quarterly", "maturity"}),
+            step_down_enabled=_bool(qs, "step_down_enabled", False),
+            step_down=_float(qs, "step_down", 0.0),
         )
         paths = min(max(_int(qs, "paths", 5000), 1000), 30000)
 
@@ -665,6 +799,11 @@ class DemoHandler(BaseHTTPRequestHandler):
             knock_in=terms.knock_in,
             observation_frequency=terms.observation_frequency,
             steps_per_year=terms.steps_per_year,
+            lockout_months=terms.lockout_months,
+            knock_in_observation=terms.knock_in_observation,
+            knock_out_observation=terms.knock_out_observation,
+            step_down_enabled=terms.step_down_enabled,
+            step_down=terms.step_down,
         )
         par_result = mc.fair_coupon(snapshot.spot, par_terms, paths=paths)
         quoted_result = mc.price(snapshot.spot, terms, paths=paths)
@@ -682,6 +821,14 @@ class DemoHandler(BaseHTTPRequestHandler):
             "iv_source": iv_source,
             "iv_asof": iv_asof,
             "iv_points": iv_points,
+            "uses_real_iv": uses_real_iv,
+            "terms": {
+                "lockout_months": terms.lockout_months,
+                "knock_in_observation": terms.knock_in_observation,
+                "knock_out_observation": terms.knock_out_observation,
+                "step_down_enabled": terms.step_down_enabled,
+                "step_down": terms.step_down,
+            },
             "fair_coupon": par_result["fair_coupon"],
             "par_price": par_result["price"],
             "quoted_coupon": terms.coupon,

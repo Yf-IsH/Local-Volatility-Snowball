@@ -13,6 +13,28 @@ class SnowballTerms:
     knock_in: float = 0.75
     observation_frequency: int = 12
     steps_per_year: int = 252
+    lockout_months: int = 0
+    knock_in_observation: str = "daily"
+    knock_out_observation: str = "monthly"
+    step_down_enabled: bool = False
+    step_down: float = 0.0
+
+
+def _observation_steps(mode: str, total_steps: int, steps_per_year: int):
+    mode = (mode or "monthly").lower()
+    if mode == "daily":
+        return set(range(1, total_steps + 1))
+    if mode == "monthly":
+        every = max(1, int(round(steps_per_year / 12)))
+    elif mode == "quarterly":
+        every = max(1, int(round(steps_per_year / 4)))
+    elif mode in {"maturity", "terminal"}:
+        return {total_steps}
+    else:
+        raise ValueError(f"unsupported observation mode: {mode}")
+    steps = set(range(every, total_steps + 1, every))
+    steps.add(total_steps)
+    return steps
 
 
 class SnowballMCPricer:
@@ -29,9 +51,11 @@ class SnowballMCPricer:
         S0 = float(S0)
         total_steps = max(1, int(round(terms.maturity_years * terms.steps_per_year)))
         dt = terms.maturity_years / total_steps
-        obs_every = max(1, int(round(terms.steps_per_year / terms.observation_frequency)))
-        obs_steps = set(range(obs_every, total_steps + 1, obs_every))
-        obs_steps.add(total_steps)
+        ko_steps = _observation_steps(terms.knock_out_observation, total_steps, terms.steps_per_year)
+        ki_steps = _observation_steps(terms.knock_in_observation, total_steps, terms.steps_per_year)
+        lockout_steps = int(round(max(0, terms.lockout_months) / 12.0 * terms.steps_per_year))
+        ko_schedule = sorted(step for step in ko_steps if step > lockout_steps)
+        ko_index = {step: idx for idx, step in enumerate(ko_schedule)}
 
         alive = np.ones(paths, dtype=bool)
         knocked_in = np.zeros(paths, dtype=bool)
@@ -51,10 +75,14 @@ class SnowballMCPricer:
             S *= np.exp((self.r - self.q - 0.5 * sigmas**2) * dt + sigmas * np.sqrt(dt) * z)
 
             active = alive
-            knocked_in[active] |= S[active] <= terms.knock_in * S0
+            if step in ki_steps:
+                knocked_in[active] |= S[active] <= terms.knock_in * S0
 
-            if step in obs_steps:
-                ko = active & (S >= terms.knock_out * S0)
+            if step in ko_index:
+                ko_level = terms.knock_out
+                if terms.step_down_enabled:
+                    ko_level = max(0.0, terms.knock_out - terms.step_down * ko_index[step])
+                ko = active & (S >= ko_level * S0)
                 elapsed = step * dt
                 principal_payoff[ko] = terms.notional
                 coupon_accrual[ko] = terms.notional * elapsed
