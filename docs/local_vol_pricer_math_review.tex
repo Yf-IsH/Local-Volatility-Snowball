@@ -1,0 +1,1265 @@
+\documentclass[UTF8,a4paper,11pt]{ctexart}
+
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{booktabs,longtable,array}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{url}
+
+\geometry{left=2.2cm,right=2.2cm,top=2.4cm,bottom=2.4cm}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue,citecolor=blue}
+\setlist[itemize]{leftmargin=2em}
+\setlist[enumerate]{leftmargin=2em}
+
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\OK}{\textcolor{green!45!black}{正确}}
+\newcommand{\APPROX}{\textcolor{orange!80!black}{近似合理}}
+\newcommand{\RISK}{\textcolor{red!70!black}{有风险}}
+\newcommand{\BUG}{\textcolor{red!80!black}{需要修正}}
+
+\title{local-vol-pricer 代码底层数学原理逐函数审查}
+\author{Codex 代码审查记录}
+\date{2026-06-02}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{审查范围与结论摘要}
+
+本文件审查目录 \code{D:/HuaweiMoveData/Users/chenb/Desktop/local-vol-pricer} 中与定价数学直接相关的 Python 代码，重点包括：
+\begin{itemize}
+  \item 隐含波动率曲面：\code{core/vol_surface.py}，\code{core/surface_factory.py}，\code{data/sse_option_iv.py}；
+  \item Dupire 局部波动率：\code{core/dupire.py}；
+  \item 有限差分定价与 Monte Carlo 雪雪球定价：\code{pricer/pde_pricer.py}，\code{pricer/snowball_mc.py}；
+  \item 市场数据、历史波动率与 demo 调用链：\code{data/market_data.py}，\code{demo_app.py}；
+  \item 测试文件：\code{tests/test_calibration.py}。
+\end{itemize}
+
+用户提供的参考材料 \code{随机分析ppt总结.pdf} 共 48 页。当前环境可以打开 PDF，但中文文字抽取大量乱码，只能稳定识别目录中的 Brownian motion、Itô、SDE、PDE、Feynman-Kac、Girsanov、Black-Scholes 等主题。因此本文的公式判断主要基于代码本身与标准随机分析、风险中性定价理论；不会把无法可靠抽取的 PDF 内容作为逐句依据。
+
+\subsection{总体判断}
+
+项目主线是：
+\[
+\text{市场或演示 IV}(K,T)
+\longrightarrow C(K,T)
+\longrightarrow \sigma_{\mathrm{loc}}(K,T)
+\longrightarrow \text{PDE 或 Monte Carlo 定价}.
+\]
+这条链路在数学结构上是合理的。Black-Scholes 公式、带连续分红率 \(q\) 的 Dupire 公式、局部波动率 PDE、log-Euler 风险中性路径模拟、公允年化票息的线性反解，代码中的主体公式基本对应正确。
+
+但是，该项目更适合作为 demo 或研究原型，不应直接视为生产级交易定价器。关键原因如下：
+\begin{enumerate}
+  \item \BUG{} \code{data/sse_option_iv.py} 中 \code{_last_wednesday} 使用“最后一个星期三”作为 ETF 期权到期日；上交所股票期权交易规则第九条及 ETF 期权合约条款均说明，到期日为到期月份第四个星期三，遇法定节假日或交易所休市日顺延。官方规则见：\url{https://www.sse.com.cn/lawandrules/sselawsrules2025/option/c/c_20250610_10781448.shtml}。在有 5 个星期三的月份，代码会把到期日多算约 7 天，从而影响 \(\tau\)、IV 期限结构、Dupire 局部波动率与雪雪球定价。
+  \item \RISK{} IV 曲面直接对 implied volatility 做样条或反距离插值，没有检查静态无套利条件。Dupire 需要 \(C(K,T)\) 关于 \(K\) 凸、关于 \(T\) 合理单调，否则 \(\partial_{KK}C\) 或分子可能失真。
+  \item \RISK{} demo 默认 \(q=0\)。ETF 与指数存在股息或分红收益率，若 \(q\) 与市场 IV 计算假设不一致，Black-Scholes 价格曲面和 Dupire 曲面会系统偏离。
+  \item \APPROX{} Dupire 负分子、非正密度或数值不稳定时直接回退到 implied volatility。这能避免程序崩溃，但会掩盖曲面无套利或数值微分问题。
+  \item \APPROX{} 雪雪球条款实现是常见简化版本。观察日、锁定期、降敲、票息支付、敲入后敲出处理与真实合同可能不同，需要逐合同核对。
+\end{enumerate}
+
+\subsection{测试结果}
+
+已运行：
+\[
+\code{python -m pytest tests -v}
+\]
+结果为 4 个测试全部通过。测试覆盖：
+\begin{itemize}
+  \item 平坦 IV 下 Dupire 能恢复常数波动率；
+  \item 局部波动率 PDE 在平坦波动率下近似 Black-Scholes 欧式看涨价格；
+  \item 雪雪球四类路径概率互斥且穷尽；
+  \item 锁定期会降低早期敲出概率。
+\end{itemize}
+这些测试可以支持核心公式没有明显方向性错误，但不能证明真实 ETF 期权数据、交易日历、曲面无套利、复杂雪雪球合同条款均正确。
+
+\section{统一数学框架}
+
+\subsection{风险中性局部波动率模型}
+
+代码默认在风险中性测度 \(\mathbb Q\) 下建模标的价格：
+\[
+\frac{dS_t}{S_t}
+=
+(r-q)\,dt+\sigma_{\mathrm{loc}}(S_t,t)\,dW_t^{\mathbb Q},
+\]
+其中：
+\begin{itemize}
+  \item \(r\) 为连续复利无风险利率；
+  \item \(q\) 为连续分红率或便利收益率；
+  \item \(\sigma_{\mathrm{loc}}(S,t)\) 是待校准的局部波动率；
+  \item \(W_t^{\mathbb Q}\) 是风险中性 Brownian motion。
+\end{itemize}
+
+若 \(V(S,t)\) 是剩余期限为 \(t\) 的衍生品价格，则在无套利和足够光滑条件下满足 backward PDE：
+\[
+\frac{\partial V}{\partial t}
+=
+\frac12\sigma_{\mathrm{loc}}^2(S,t)S^2\frac{\partial^2V}{\partial S^2}
++(r-q)S\frac{\partial V}{\partial S}
+-rV.
+\]
+代码中的 \code{PDEPricer} 正是在这个剩余期限变量 \(t\) 上从终端 payoff 向前推进。
+
+\subsection{从 implied volatility 到 call price surface}
+
+交易所或市场给出的 implied volatility \(\sigma_{\mathrm{imp}}(K,T)\) 不是随机过程的瞬时波动率，而是使 Black-Scholes 价格等于市场价格的参数：
+\[
+C^{\mathrm{mkt}}(K,T)
+=
+BSCall(S_0,K,T,r,q,\sigma_{\mathrm{imp}}(K,T)).
+\]
+代码先把 IV 曲面转成看涨期权价格曲面 \(C(K,T)\)，再对 \(C\) 做 Dupire 微分。因此，IV 曲面的插值质量会直接影响局部波动率。
+
+\subsection{Dupire 公式}
+
+设
+\[
+C(K,T)=e^{-rT}\mathbb E^{\mathbb Q}\bigl[(S_T-K)^+\bigr].
+\]
+在局部波动率模型下，若 \(C\) 足够光滑且无静态套利，则
+\[
+\sigma_{\mathrm{loc}}^2(K,T)
+=
+\frac{
+\partial_T C(K,T)+qC(K,T)+(r-q)K\partial_K C(K,T)
+}{
+\frac12K^2\partial_{KK}C(K,T)
+}.
+\]
+代码 \code{LocalVolPricer.local_vol} 使用的正是这个形式。需要注意：代码注释写了 ``undiscounted input call price''，但实际调用的 \code{black_scholes_call} 返回的是贴现后的 Black-Scholes 现值价格。上述公式也正是贴现价格 \(C\) 下的公式。因此公式实现是正确的，注释中的 ``undiscounted'' 表述不准确。
+
+\section{函数级别总览}
+
+\begin{longtable}{p{0.25\textwidth}p{0.18\textwidth}p{0.47\textwidth}}
+\toprule
+函数或类 & 判定 & 核心说明 \\
+\midrule
+\endhead
+\code{VolSurface.__init__} & \APPROX & 构造平滑 IV 曲面，维度和正值检查正确，但未保证无套利。\\
+\code{VolSurface.get_iv} & \APPROX & 插值并边界截断，适合 demo；边界外平坦外推会影响 Dupire 微分。\\
+\code{black_scholes_call} & \OK & 带连续分红率 \(q\) 的 Black-Scholes 看涨公式正确。\\
+\code{black_scholes_put} & \OK & Put-call parity 正确。\\
+\code{build_demo_iv_surface} & \APPROX & 生成可视化演示曲面，不是市场校准或无套利曲面。\\
+\code{LocalVolPricer.local_vol} & \OK/\APPROX & Dupire 主公式正确，有限差分与 fallback 是数值近似。\\
+\code{PDEPricer.price_european} & \OK/\APPROX & 隐式有限差分 PDE 结构正确，边界和网格是启发式。\\
+\code{_observation_steps} & \APPROX & 将日/月/季观察映射到等间距交易步，忽略真实日历。\\
+\code{SnowballMCPricer._simulate_components} & \OK/\APPROX & 风险中性 log-Euler 与基本雪雪球现金流合理，合同细节简化。\\
+\code{SnowballMCPricer.fair_coupon} & \OK/\APPROX & 票息线性反解正确；clip 可能破坏严格平价。\\
+\code{realized_volatility} & \OK/\APPROX & 对数收益年化波动率公式正确，适合作演示锚点。\\
+\code{_last_wednesday} & \BUG & 对上交所 ETF 期权到期日规则不准确，应改为第四个星期三并考虑休市顺延。\\
+\code{_grid_surface} & \APPROX/\RISK & 反距离 IV 插值能运行，但非无套利、非价格层面校准。\\
+\code{DemoHandler._price} & \APPROX & 参数传递清楚，但默认 \(q=0\)、真实 IV fallback、简化条款会影响实盘含义。\\
+\bottomrule
+\end{longtable}
+
+\section{\code{core/vol_surface.py}}
+
+\subsection{\code{VolSurface}}
+
+该类表示一个二维 implied volatility 曲面：
+\[
+(K_i,T_j)\mapsto \sigma_{\mathrm{imp}}(K_i,T_j).
+\]
+其核心不是直接定价局部波动率模型，而是把离散 IV 数据变成可连续查询的函数 \(\sigma_{\mathrm{imp}}(K,T)\)，并通过 Black-Scholes 公式得到 \(C(K,T)\)。
+
+\subsection{\code{VolSurface.__init__(strikes, maturities, iv_matrix)}}
+
+\paragraph{数学含义}
+输入为严格递增的行权价网格：
+\[
+K_1<K_2<\cdots<K_m,
+\]
+严格递增的期限网格：
+\[
+T_1<T_2<\cdots<T_n,
+\]
+以及矩阵：
+\[
+\Sigma_{ij}=\sigma_{\mathrm{imp}}(K_i,T_j)>0.
+\]
+代码要求：
+\[
+\mathrm{shape}(\Sigma)=(m,n),
+\qquad
+\Delta K_i>0,\quad \Delta T_j>0,
+\qquad
+\Sigma_{ij}>0.
+\]
+随后使用 \code{RectBivariateSpline} 构造二维样条：
+\[
+\widehat\sigma_{\mathrm{imp}}(K,T)
+=
+\mathrm{spline}(K,T).
+\]
+
+\paragraph{正确性}
+输入检查是必要且正确的。样条阶数
+\[
+k_x=\min(3,m-1),\qquad k_y=\min(3,n-1)
+\]
+避免网格点过少时三次样条不可用，这一点工程上合理。
+
+\paragraph{风险}
+直接对 \(\sigma_{\mathrm{imp}}\) 做样条并不保证价格曲面无套利。Dupire 真正需要的是 \(C(K,T)\) 满足：
+\[
+\partial_{KK}C(K,T)\ge 0,
+\]
+即看涨价格关于行权价凸；同时日历方向不能出现明显套利。一个正的、平滑的 IV 曲面仍可能生成非凸的价格曲面，导致 Dupire 分母为负或接近 0。
+
+更稳妥的生产做法通常是在 total variance
+\[
+w(k,T)=\sigma_{\mathrm{imp}}^2(k,T)T,\qquad k=\log(K/F_T)
+\]
+层面插值，并加入 butterfly/calendar arbitrage 约束。
+
+\subsection{\code{min_strike}, \code{max_strike}, \code{min_maturity}, \code{max_maturity}}
+
+这些属性返回校准网格边界：
+\[
+K_{\min},K_{\max},T_{\min},T_{\max}.
+\]
+数学上没有复杂内容，主要供边界截断和可视化使用。实现正确。
+
+\subsection{\code{get_iv(K,T)}}
+
+\paragraph{数学含义}
+代码先做边界截断：
+\[
+K^\ast=\min(\max(K,K_{\min}),K_{\max}),
+\qquad
+T^\ast=\min(\max(T,T_{\min}),T_{\max}),
+\]
+再返回：
+\[
+\max\{\widehat\sigma_{\mathrm{imp}}(K^\ast,T^\ast),10^{-8}\}.
+\]
+
+\paragraph{正确性}
+作为 demo，截断比不受控外推更安全。返回值下界 \(10^{-8}\) 避免 Black-Scholes 中除以 0。
+
+\paragraph{风险}
+边界外平坦外推会在 \(K_{\min},K_{\max},T_{\min},T_{\max}\) 附近制造不可见的导数不连续。Dupire 依赖 \(\partial_T C\)、\(\partial_K C\)、\(\partial_{KK}C\)，因此边界附近的局部波动率可能主要反映截断规则，而不是真实市场信息。
+
+\subsection{\code{black_scholes_call(S,K,T,r,q=0.0)}}
+
+\paragraph{数学公式}
+若 \(T>0\)，代码使用：
+\[
+d_1=
+\frac{
+\log(S/K)+(r-q+\frac12\sigma^2)T
+}{
+\sigma\sqrt T
+},
+\qquad
+d_2=d_1-\sigma\sqrt T,
+\]
+\[
+C
+=
+Se^{-qT}N(d_1)-Ke^{-rT}N(d_2),
+\]
+其中：
+\[
+\sigma=\widehat\sigma_{\mathrm{imp}}(K,T).
+\]
+若 \(T\le 10^{-8}\)，返回到期 payoff：
+\[
+C=(S-K)^+.
+\]
+
+\paragraph{正确性}
+这是带连续分红率 \(q\) 的标准 Black-Scholes 欧式看涨公式，数学上正确。
+
+\paragraph{边界}
+代码没有显式检查 \(S>0,K>0\)。在项目调用链中 \(S\) 和 \(K\) 通常为正；若外部传入非正值，\(\log(S/K)\) 会失效。
+
+\subsection{\code{black_scholes_put(S,K,T,r,q=0.0)}}
+
+\paragraph{数学公式}
+代码使用 put-call parity：
+\[
+P=C-Se^{-qT}+Ke^{-rT}.
+\]
+在 \(T\le 10^{-8}\) 时返回：
+\[
+P=(K-S)^+.
+\]
+
+\paragraph{正确性}
+在欧式期权、连续分红率、无套利假设下，put-call parity 正确。实现无明显数学问题。
+
+\section{\code{core/surface_factory.py}}
+
+\subsection{\code{build_demo_iv_surface(spot, base_vol, smile_strength, term_slope)}}
+
+\paragraph{数学含义}
+该函数构造一个演示用 implied volatility 曲面。设
+\[
+m=\log(K/S_0).
+\]
+代码给出：
+\[
+\sigma_{\mathrm{imp}}(K,T)
+=
+\mathrm{clip}\left(
+\sigma_0
+-0.08m
+\;+\;\alpha m^2
+\;+\;\beta(1-e^{-1.8T}),
+0.05,0.9
+\right),
+\]
+其中 \(\alpha=\code{smile_strength}\)，\(\beta=\code{term_slope}\)。
+
+\paragraph{含义解释}
+\begin{itemize}
+  \item \(-0.08m\)：当 \(K>S_0\) 时 \(m>0\)，该项降低高行权价 IV；当 \(K<S_0\) 时 \(m<0\)，该项抬高低行权价 IV，形成权益市场常见负 skew。
+  \item \(\alpha m^2\)：产生 smile 曲率。
+  \item \(\beta(1-e^{-1.8T})\)：产生期限结构。默认 \(\beta<0\)，期限越长 IV 略低。
+\end{itemize}
+
+\paragraph{正确性}
+作为演示曲面合理，尤其在没有真实指数期权链时能提供稳定形状。
+
+\paragraph{风险}
+这不是市场校准曲面，也不保证由无套利价格曲面生成。它不应被解释为真实市场对未来分布的估计。若用它定价指数雪雪球，结果只能说明模型流程，不代表可交易报价。
+
+\section{\code{core/dupire.py}}
+
+\subsection{\code{LocalVolPricer.__init__(vol_surface, spot, r, q)}}
+
+该函数保存：
+\[
+S_0,\quad r,\quad q,\quad \sigma_{\mathrm{imp}}(K,T).
+\]
+数学上它定义了从 IV 曲面构造 call price surface 的基础参数。无明显问题。
+
+\subsection{\code{LocalVolPricer._call(K,T)}}
+
+\paragraph{数学含义}
+该函数返回：
+\[
+C(K,T)
+=
+BSCall(S_0,K,T,r,q,\sigma_{\mathrm{imp}}(K,T)).
+\]
+这是 Dupire 所需的看涨价格曲面。
+
+\paragraph{正确性}
+只要输入 IV 与 \(r,q,S_0\) 的市场假设一致，该转换是正确的。
+
+\paragraph{风险}
+真实交易所给出的 implied volatility 通常隐含了交易所或行情源使用的利率、分红、远期假设。若本代码使用的 \(r,q\) 与行情源不同，则由 IV 反推的 \(C(K,T)\) 并非严格市场价格曲面。
+
+\subsection{\code{LocalVolPricer.local_vol(K,T)}}
+
+\paragraph{数学公式}
+代码实现：
+\[
+\sigma_{\mathrm{loc}}^2(K,T)
+=
+\frac{
+C_T+qC+(r-q)KC_K
+}{
+\frac12K^2C_{KK}
+}.
+\]
+这与带连续分红率 \(q\) 的 Dupire 公式一致。
+
+\paragraph{有限差分}
+代码使用：
+\[
+\Delta T=\max(10^{-4},10^{-3}T),
+\qquad
+\Delta K=\max(10^{-2},10^{-4}K).
+\]
+时间导数在可行时使用中心差分：
+\[
+C_T(K,T)\approx
+\frac{C(K,T+\Delta T)-C(K,T-\Delta T)}{2\Delta T}.
+\]
+若 \(T-\Delta T<T_{\min}\)，使用前向差分：
+\[
+C_T(K,T)\approx
+\frac{C(K,T+\Delta T)-C(K,T)}{\Delta T}.
+\]
+行权价方向使用：
+\[
+C_K(K,T)\approx
+\frac{C(K+\Delta K,T)-C(K-\Delta K,T)}{2\Delta K},
+\]
+\[
+C_{KK}(K,T)\approx
+\frac{C(K+\Delta K,T)-2C(K,T)+C(K-\Delta K,T)}{\Delta K^2}.
+\]
+
+\paragraph{正确性}
+主公式正确；平坦波动率测试中能恢复常数波动率，说明符号和 \(r,q\) 项没有明显错误。
+
+\paragraph{重要注释问题}
+代码 docstring 称 \(C(K,T)\) 是 ``undiscounted input call price''。实际 \code{black_scholes_call} 计算的是贴现后的欧式期权现值。当前 Dupire 公式与贴现价格一致，因此代码公式本身正确，但注释容易误导，应改成 ``discounted call price'' 或 ``time-0 call price''。
+
+\paragraph{风险与边界}
+\begin{enumerate}
+  \item 若 \(C_{KK}\le 0\)，这意味着价格曲面违反凸性或数值微分噪声过大。代码在分母过小时回退到 IV：
+  \[
+  \sigma_{\mathrm{loc}}(K,T)=\sigma_{\mathrm{imp}}(K,T).
+  \]
+  这能保持程序可运行，但不是严格的 Dupire 校准。
+  \item 若分子小于等于 0，代码也回退到 IV。这通常意味着期限结构或利率项导致局部方差为负，属于曲面或数据问题。
+  \item 在 \(T<T_{\min}\) 或 \(T>T_{\max}\) 附近，IV 被截断，\(C_T\) 对边界规则很敏感。
+  \item \(\Delta K=10^{-2}\) 是绝对最小步长。对 ETF 价格 \(S\approx 3\) 时约为 0.3\%，尚可；对非常低价标的则可能偏大。
+\end{enumerate}
+
+\section{\code{pricer/pde_pricer.py}}
+
+\subsection{\code{PDEPricer.__init__(local_vol_pricer, r, q, space_steps, time_steps)}}
+
+该函数保存 PDE 网格参数：
+\[
+M=\code{space_steps},\qquad N=\code{time_steps}.
+\]
+数学上没有复杂逻辑，但 \(M,N\) 控制有限差分误差。更大的 \(M,N\) 通常更准确，但计算更慢。
+
+\subsection{\code{PDEPricer.price_european(S0,K,T,is_call=True)}}
+
+\paragraph{PDE}
+代码求解剩余期限变量 \(\tau\in[0,T]\) 下的 PDE：
+\[
+\frac{\partial V}{\partial \tau}
+=
+\frac12\sigma_{\mathrm{loc}}^2(S,\tau)S^2V_{SS}
++(r-q)SV_S-rV,
+\]
+初值为到期 payoff：
+\[
+V(S,0)=
+\begin{cases}
+(S-K)^+,& \text{call},\\
+(K-S)^+,& \text{put}.
+\end{cases}
+\]
+
+\paragraph{空间网格}
+代码取：
+\[
+S_{\max}=\max(3S_0,2.5K),\qquad
+\Delta S=\frac{S_{\max}}{M},
+\]
+\[
+S_i=i\Delta S,\qquad i=0,\ldots,M.
+\]
+这是常见截断方法。
+
+\paragraph{有限差分系数}
+令
+\[
+D_i=\frac12\sigma_{\mathrm{loc}}^2(S_i,\tau)S_i^2,\qquad
+\mu_i=(r-q)S_i.
+\]
+中心差分下：
+\[
+V_S\approx \frac{V_{i+1}-V_{i-1}}{2\Delta S},
+\qquad
+V_{SS}\approx \frac{V_{i+1}-2V_i+V_{i-1}}{\Delta S^2}.
+\]
+于是生成元 \(\mathcal L\) 的三对角系数为：
+\[
+a_i=\frac{D_i}{\Delta S^2}-\frac{\mu_i}{2\Delta S},
+\]
+\[
+b_i=-2\frac{D_i}{\Delta S^2}-r,
+\]
+\[
+c_i=\frac{D_i}{\Delta S^2}+\frac{\mu_i}{2\Delta S}.
+\]
+隐式 Euler 为：
+\[
+(I-\Delta t\,\mathcal L)V^{n+1}=V^n.
+\]
+代码矩阵中：
+\[
+\mathrm{lower}=-\Delta t\,a_i,\quad
+\mathrm{diag}=1-\Delta t\,b_i,\quad
+\mathrm{upper}=-\Delta t\,c_i,
+\]
+与隐式格式一致。
+
+\paragraph{边界条件}
+看涨期权：
+\[
+V(0,\tau)=0,
+\qquad
+V(S_{\max},\tau)\approx S_{\max}e^{-q\tau}-Ke^{-r\tau}.
+\]
+看跌期权：
+\[
+V(0,\tau)\approx Ke^{-r\tau},
+\qquad
+V(S_{\max},\tau)=0.
+\]
+这与欧式期权远端渐近边界一致。
+
+\paragraph{正确性}
+PDE 符号、漂移项、贴现项和边界条件整体正确。测试中平坦波动率 PDE 价格与 Black-Scholes 看涨价误差小于 0.25，支持实现方向正确。
+
+\paragraph{风险}
+\begin{enumerate}
+  \item 中心差分在低扩散、高漂移、靠近 \(S=0\) 时可能不是单调格式，极端参数下可能出现轻微负价格或振荡。更稳妥可使用 upwind 或对数价格网格。
+  \item \(S_{\max}=\max(3S_0,2.5K)\) 是启发式。长久期、高波动或深度实值/虚值时边界误差可能不小。
+  \item 最后使用 cubic interpolation 从 \(S\)-网格插值到 \(S_0\)。三次插值平滑，但不保证单调和正性；价格曲线若有局部数值噪声，线性插值更稳。
+  \item 该 PDE 只用于欧式 vanilla 期权，不用于雪雪球。雪雪球定价在 \code{SnowballMCPricer} 中由路径模拟完成。
+\end{enumerate}
+
+\section{\code{pricer/snowball_mc.py}}
+
+\subsection{\code{SnowballTerms}}
+
+该 dataclass 保存雪雪球合同参数。数学解释如下：
+\begin{itemize}
+  \item \(\code{notional}=N_0\)：名义本金；
+  \item \(\code{maturity_years}=T\)：期限，单位年；
+  \item \(\code{coupon}=c\)：年化票息；
+  \item \(\code{knock_out}=B_{\mathrm{KO}}\)：敲出水平，代码按 \(B_{\mathrm{KO}}S_0\) 判断；
+  \item \(\code{knock_in}=B_{\mathrm{KI}}\)：敲入水平，代码按 \(B_{\mathrm{KI}}S_0\) 判断；
+  \item \(\code{steps_per_year}=252\)：每年交易步数；
+  \item \(\code{lockout_months}\)：锁定期月数；
+  \item \(\code{knock_in_observation}\)，\(\code{knock_out_observation}\)：敲入和敲出观察频率；
+  \item \(\code{step_down_enabled}\)，\(\code{step_down}\)：是否降敲及每次观察降低幅度。
+\end{itemize}
+
+\paragraph{风险}
+\code{observation_frequency} 当前未被使用。若真实合同以该字段控制观察频率，代码没有反映。
+
+\subsection{\code{_observation_steps(mode,total_steps,steps_per_year)}}
+
+\paragraph{数学含义}
+该函数把观察频率映射到离散步集合 \(\mathcal O\subset\{1,\ldots,n\}\)。
+\[
+\mathcal O_{\mathrm{daily}}=\{1,2,\ldots,n\}.
+\]
+月度观察：
+\[
+\Delta_{\mathrm{month}}=\mathrm{round}(252/12)=21,
+\qquad
+\mathcal O_{\mathrm{monthly}}=\{21,42,63,\ldots\}\cup\{n\}.
+\]
+季度观察：
+\[
+\Delta_{\mathrm{quarter}}=\mathrm{round}(252/4)=63.
+\]
+仅到期观察：
+\[
+\mathcal O_{\mathrm{maturity}}=\{n\}.
+\]
+
+\paragraph{正确性}
+在等间距交易日网格中，这个映射清晰且可运行。
+
+\paragraph{风险}
+真实雪雪球合同通常按具体日历日观察，例如每月某日、遇非交易日顺延或提前。代码用固定 21 个交易日近似一个月，可能与真实合同现金流日期不一致。
+
+\subsection{\code{SnowballMCPricer.__init__(local_vol_pricer,r,q,seed)}}
+
+该函数保存局部波动率模型、利率参数和随机数种子。固定 seed 使每次定价可复现。注意 \code{_simulate_components} 每次都会重新用同一个 seed 初始化随机数，因此 \code{fair_coupon} 与 \code{price} 使用相同随机路径，这有利于比较不同票息下的 PV，但不同调用结果不是独立 Monte Carlo 样本。
+
+\subsection{\code{SnowballMCPricer._simulate_components(S0,terms,paths)}}
+
+\paragraph{路径离散}
+总步数：
+\[
+n=\mathrm{round}(T\cdot \code{steps_per_year}),
+\qquad
+\Delta t=\frac{T}{n}.
+\]
+风险中性 log-Euler 更新为：
+\[
+S_{t+\Delta t}
+=
+S_t\exp\left[
+\left(r-q-\frac12\sigma_{\mathrm{loc}}^2(S_t,t)\right)\Delta t
++\sigma_{\mathrm{loc}}(S_t,t)\sqrt{\Delta t}Z
+\right],
+\quad Z\sim N(0,1).
+\]
+这对应局部波动率 SDE 的一阶弱近似。
+
+\paragraph{局部波动率插值}
+每一步代码先在
+\[
+[0.35S_0,\,2.2S_0]
+\]
+上建立 90 个价格点的局部波动率数组，再对当前所有路径用一维线性插值。这减少了逐路径调用 Dupire 的成本。
+
+若 \(S_t\) 超出该区间，代码用边界值外推：
+\[
+S_t^{\ast}=\min(\max(S_t,0.35S_0),2.2S_0).
+\]
+这能避免异常，但极端路径的波动率会被截断。
+
+\paragraph{敲入逻辑}
+若当前步属于敲入观察集合 \(\mathcal O_{\mathrm{KI}}\)，则对仍存续路径检查：
+\[
+S_t\le B_{\mathrm{KI}}S_0.
+\]
+满足条件的路径设置为 \code{knocked_in=True}。
+
+\paragraph{敲出逻辑}
+锁定期转换为：
+\[
+n_{\mathrm{lock}}
+=
+\mathrm{round}\left(
+\frac{\code{lockout_months}}{12}\cdot 252
+\right).
+\]
+代码仅允许
+\[
+\text{step}>n_{\mathrm{lock}}
+\]
+的敲出观察日触发敲出。若产品定义为“满 6 个月当天即可观察”，则该严格大于条件可能把第一次可敲出日推迟一个观察期；若定义为“前 6 个月不观察”，则逻辑合理。
+
+若开启降敲，第 \(j\) 个可敲出观察日的敲出水平为：
+\[
+B_{\mathrm{KO},j}
+=
+\max(0,B_{\mathrm{KO}}-j\cdot \code{step_down}),
+\qquad j=0,1,2,\ldots
+\]
+注意 \(j\) 从锁定期后的第一个可观察日开始计数，而不是从合同初始月开始计数。真实合同若在锁定期内也累计降敲，这里会有偏差。
+
+敲出判断为：
+\[
+S_t\ge B_{\mathrm{KO},j}S_0.
+\]
+敲出后：
+\[
+\text{principal}=N_0,\qquad
+\text{coupon accrual}=N_0\,t,\qquad
+\text{pay time}=t.
+\]
+
+\paragraph{到期未敲出逻辑}
+对未敲出路径，若曾敲入：
+\[
+\text{principal}
+=
+N_0\left(1+\min\left(\frac{S_T}{S_0}-1,0\right)\right)
+=
+N_0\min\left(\frac{S_T}{S_0},1\right),
+\]
+且不给票息。
+
+若未敲入：
+\[
+\text{principal}=N_0,\qquad
+\text{coupon accrual}=N_0T.
+\]
+
+\paragraph{贴现}
+对每条路径：
+\[
+\text{principal PV}
+=
+e^{-r\tau_i}\text{principal}_i,
+\]
+\[
+\text{coupon annuity PV}
+=
+e^{-r\tau_i}\text{coupon accrual}_i.
+\]
+给定年化票息 \(c\)，路径 PV 为：
+\[
+X_i(c)=A_i+cB_i,
+\]
+其中 \(A_i\) 为本金相关 PV，\(B_i\) 为单位年化票息的贴现系数。
+
+\paragraph{正确性}
+对一个基础型“敲出返本付息、敲入未敲出按标的跌幅亏损、未敲入未敲出返本付息”的雪雪球，现金流逻辑是合理的。
+
+\paragraph{风险}
+\begin{enumerate}
+  \item 被敲出的路径仍继续模拟 \(S\)，只是后续不再参与敲入敲出判断。PV 不受影响，但返回的 \code{terminal_mean} 包含这些已经结束的路径，不应解释为产品到期时所有路径的经济终值。
+  \item 敲入检查先于敲出检查。正常参数下 \(B_{\mathrm{KI}}<B_{\mathrm{KO}}\)，同一步不可能同时触发；若用户输入异常参数，则分类可能不符合经济直觉。
+  \item 票息按 \(N_0\times\text{elapsed year}\) 线性累计。真实产品可能按整月、整季度、实际天数或合同约定计息。
+  \item 贴现只用连续无风险利率 \(r\)，没有信用利差、融资成本、保证金、交易对手风险或税费。
+  \item 局部波动率模型只校准 vanilla 分布，不直接校准敲入敲出路径分布。路径依赖产品对 volatility dynamics 敏感，local vol 与 stochastic vol 的敲障概率可能明显不同。
+\end{enumerate}
+
+\subsection{\code{SnowballMCPricer._summary(components,pv)}}
+
+\paragraph{四类路径}
+代码把最终路径分为：
+\[
+A=\{\text{alive}\cap\neg\text{knocked\_in}\},
+\]
+\[
+B=\{\text{knocked\_out}\cap\neg\text{ki\_before\_ko}\},
+\]
+\[
+C=\{\text{alive}\cap\text{knocked\_in}\},
+\]
+\[
+D=\{\text{knocked\_out}\cap\text{ki\_before\_ko}\}.
+\]
+分别对应：
+\begin{itemize}
+  \item 未敲入、未敲出；
+  \item 未敲入后敲出；
+  \item 敲入后未敲出；
+  \item 敲入后敲出。
+\end{itemize}
+在代码逻辑下，\(\text{alive}\) 与 \(\text{knocked\_out}\) 互补，因此四类互斥且穷尽：
+\[
+\mathbb P(A)+\mathbb P(B)+\mathbb P(C)+\mathbb P(D)=1.
+\]
+测试文件已经验证该关系。
+
+\paragraph{统计量}
+价格估计：
+\[
+\widehat{PV}=\frac1N\sum_{i=1}^N X_i.
+\]
+标准误：
+\[
+\widehat{\mathrm{SE}}
+=
+\frac{s_X}{\sqrt N},
+\qquad
+s_X^2=\frac1{N-1}\sum_{i=1}^N(X_i-\bar X)^2.
+\]
+公式正确。若路径数 \(N=1\)，样本标准差自由度会有问题；UI 限制路径数至少 1000，因此实际 demo 不受影响。
+
+\subsection{\code{SnowballMCPricer.price(S0,terms,paths)}}
+
+该函数计算：
+\[
+\widehat{PV}(c)
+=
+\frac1N\sum_{i=1}^N(A_i+cB_i),
+\]
+其中 \(c=\code{terms.coupon}\)。数学含义清晰，正确性取决于 \code{_simulate_components} 中现金流定义。
+
+\subsection{\code{SnowballMCPricer.fair_coupon(S0,terms,paths)}}
+
+\paragraph{数学公式}
+公允票息 \(c^\ast\) 定义为：
+\[
+N_0=\mathbb E^{\mathbb Q}[A+c^\ast B].
+\]
+Monte Carlo 估计为：
+\[
+N_0\approx \bar A+c^\ast \bar B,
+\]
+因此：
+\[
+c^\ast=\frac{N_0-\bar A}{\bar B}.
+\]
+代码中：
+\[
+\bar A=\mathrm{mean}(\code{principal_pv}),
+\qquad
+\bar B=\mathrm{mean}(\code{coupon_annuity_pv}).
+\]
+
+\paragraph{正确性}
+由于现金流对年化票息 \(c\) 是线性的，这个反解公式正确。
+
+\paragraph{风险}
+代码将票息裁剪到：
+\[
+c^\ast\in[-1,2].
+\]
+若未裁剪解落在区间外，返回的 \code{fair_coupon} 不再严格满足 \(PV=N_0\)。这对 demo 防止异常输出有用，但若做数学报告或交易报价，应同时返回未裁剪解和裁剪提示。
+
+\section{\code{data/market_data.py}}
+
+\subsection{\code{MarketSnapshot}}
+
+该 dataclass 保存行情快照：
+\[
+\{S_0,\text{历史 close},\text{日期},\widehat\sigma_{\mathrm{hist}},\text{来源},\text{asof}\}.
+\]
+数学上主要承载 spot 与历史波动率输入。
+
+\subsection{\code{_sample_base(index_key)}, \code{_sample_vol(index_key)}}
+
+这两个函数返回离线演示数据的初始价格和波动率锚点。它们不是统计估计，也不是市场校准，只是 fallback 常数。数学上只能解释为模拟参数。
+
+\subsection{\code{_parse_eastmoney_klines(payload,index_key)}}
+
+该函数把 Eastmoney 日 K 数据解析为：
+\[
+(\text{date},O,C,H,L,\text{volume},\text{amount}).
+\]
+其数学作用是为 realized volatility 提供 close 序列。解析本身不涉及定价公式。
+
+\paragraph{风险}
+代码假设接口字段顺序稳定、数据按时间排序且 close 为正。若接口格式变化，后续波动率估计会受影响。
+
+\subsection{\code{_fetch_eastmoney(index_key,lookback_days)}}
+
+该函数请求日线历史数据。数学上没有定价公式，但数据窗口影响：
+\[
+\widehat\sigma_{\mathrm{hist}}
+=
+\sqrt{252}\,\mathrm{std}(\Delta\log S).
+\]
+若请求失败，会进入缓存或样本数据。
+
+\subsection{\code{_load_cache(index_key)}}
+
+从本地 CSV 读取历史行情。数学上等价于给定历史 close 序列。无明显数学问题。
+
+\subsection{\code{_sample_history(index_key,days)}}
+
+\paragraph{数学模型}
+离线样本历史使用几何 Brownian motion：
+\[
+S_{t+\Delta t}
+=
+S_t\exp\left(\mu\Delta t+\sigma\sqrt{\Delta t}Z\right),
+\]
+其中代码中：
+\[
+\mu=-0.02,\qquad \Delta t=\frac1{252},\qquad
+\sigma=\code{_sample_vol(index_key)}.
+\]
+
+\paragraph{风险}
+该函数只用于离线 fallback，不能代表真实历史。随机种子使用 Python 的 \code{hash(index_key)}，在启用 hash randomization 的环境中不同进程可能不同，因此样本历史不完全可复现。若要稳定演示，应改为固定映射或稳定哈希。
+
+\subsection{\code{load_index_history(index_key,lookback_days)}}
+
+该函数按优先级返回：
+\[
+\text{实时接口数据}\rightarrow \text{本地缓存}\rightarrow \text{离线样本数据}.
+\]
+数学风险在于：当真实接口失败且缓存缺失时，系统仍能输出定价结果，但输入已变成模拟数据。文档或 UI 应明确标注数据来源，避免把 demo 结果误认为真实行情定价。
+
+\subsection{\code{realized_volatility(close,window=252)}}
+
+\paragraph{数学公式}
+令：
+\[
+r_i=\log\frac{S_i}{S_{i-1}}.
+\]
+代码估计：
+\[
+\widehat\sigma_{\mathrm{ann}}
+=
+\sqrt{252}\cdot
+\sqrt{
+\frac1{n-1}\sum_{i=1}^n(r_i-\bar r)^2
+}.
+\]
+随后裁剪到：
+\[
+[0.05,0.8].
+\]
+
+\paragraph{正确性}
+这是标准 close-to-close 年化历史波动率估计。作为 demo IV 曲面的 base vol 锚点合理。
+
+\paragraph{边界}
+若 close 长度小于 3，返回 0.2。若 close 非正，\(\log\) 会产生无效值；代码未显式检查。
+
+\subsection{\code{load_market_snapshot(index_key,lookback_days)}}
+
+该函数组合历史数据、spot 和 realized volatility。数学上返回：
+\[
+S_0=S_{\mathrm{last}},
+\qquad
+\widehat\sigma_{\mathrm{hist}}=\code{realized_volatility(close)}.
+\]
+实现清晰。风险主要来自数据源 fallback 与中文名称编码乱码，不影响公式但影响展示可信度。
+
+\section{\code{data/sse_option_iv.py}}
+
+\subsection{\code{OptionIVSurface}}
+
+该 dataclass 保存：
+\[
+\{\text{VolSurface},\text{source},\text{asof},\text{raw points},\text{filtered points}\}.
+\]
+数学上表示由交易所风险指标点构建出的 IV 曲面。
+
+\subsection{\code{_previous_dates(days=12)}}
+
+返回今天及过去若干自然日。数学上没有定价公式。由于交易所只在交易日有数据，代码通过逐日尝试实现容错。合理。
+
+\subsection{\code{_cache_path(etf_key,trade_date)}}
+
+缓存路径函数，无数学内容。
+
+\subsection{\code{_request_sse_risk(trade_date)}}
+
+请求上交所期权风险指标。数学上，它把 \(\sigma_{\mathrm{imp}}\) 的原始市场输入交给后续清洗函数。
+
+\paragraph{风险}
+\code{IMPLC_VOLATLTY} 的单位必须确认。缓存样本中数值如 0.187、0.327，代码按小数年化波动率处理，即 18.7\%、32.7\%。若数据源某天改成百分数格式，定价会严重错误。当前缓存样本支持“小数格式”这一解释。
+
+\subsection{\code{_write_cache(etf_key,trade_date,rows)} 与 \code{_read_latest_cache(etf_key)}}
+
+这两个函数处理原始风险指标缓存。数学上不改变数据，只影响 fallback。无明显数学问题。
+
+\subsection{\code{load_sse_option_rows(etf_key)}}
+
+该函数筛选 \code{CONTRACT_ID} 以 ETF 标的代码开头的合约。数学上，它定义了样本空间：
+\[
+\{\text{目标 ETF 的期权合约}\}.
+\]
+若实时请求失败，使用最近缓存。合理，但结果日期可能不是当天，应在 UI 中明确展示 \code{asof}。
+
+\subsection{\code{_last_wednesday(year,month)}}
+
+\paragraph{代码逻辑}
+该函数返回某月最后一个星期三。
+
+\paragraph{问题}
+对上交所 ETF 期权，常见规则是到期月份第四个星期三，遇法定节假日或休市顺延。最后一个星期三与第四个星期三只有在该月恰好有 4 个星期三时相同；若有 5 个星期三，代码会把到期日多算 7 天。
+
+该规则可由上交所《股票期权试点交易规则》第九条核验：\url{https://www.sse.com.cn/lawandrules/sselawsrules2025/option/c/c_20250610_10781448.shtml}。上交所沪深300ETF期权、中证500ETF期权、科创50ETF期权等合约条款页面也使用同一到期日表述。
+
+例如：
+\[
+\begin{array}{c|c|c|c}
+\text{月份} & \text{第四个星期三} & \text{最后一个星期三} & \text{误差}\\
+\hline
+2026\text{-}09 & 2026\text{-}09\text{-}23 & 2026\text{-}09\text{-}30 & 7\text{天}\\
+2026\text{-}12 & 2026\text{-}12\text{-}23 & 2026\text{-}12\text{-}30 & 7\text{天}
+\end{array}
+\]
+缓存 \code{etf50_sse_option_iv_20260514.csv} 中包含 2026-09 与 2026-12 到期月份，因此当前代码对这些期限的 \(\tau\) 会偏大。
+
+\paragraph{定价影响}
+期限：
+\[
+\tau=\frac{\text{expiry}-\text{trade date}}{365}
+\]
+被高估后：
+\begin{itemize}
+  \item IV 曲面期限节点位置错误；
+  \item \(\partial_TC\) 估计受影响；
+  \item Dupire 局部波动率期限结构受影响；
+  \item 雪雪球路径模拟中对应未来时间点的局部波动率可能偏离。
+\end{itemize}
+
+\paragraph{建议}
+应改为第四个星期三，并接入交易所交易日历处理节假日顺延。若暂不接入交易日历，至少先修正为第四个星期三：
+\[
+\text{first Wednesday}+21\text{ days}.
+\]
+
+\subsection{\code{_parse_contract(contract_id)}}
+
+\paragraph{数学含义}
+对形如 \code{510050C2605M02700} 的合约编号，代码解析：
+\[
+\text{call/put}=C/P,
+\qquad
+\text{year}=2026,
+\qquad
+\text{month}=05,
+\qquad
+K=\frac{2700}{1000}=2.7.
+\]
+然后由 \code{_last_wednesday} 得到到期日。
+
+\paragraph{正确性}
+行权价解析对当前 ETF 缓存样本是正确的。合约类型 \(C/P\) 被解析但后续没有区分，因为代码对同一 \(K,T\) 的 call/put IV 取中位数。
+
+\paragraph{风险}
+到期日依赖 \code{_last_wednesday}，因此继承了上一节的错误。若交易所存在调整合约、特殊后缀或编码规则变化，正则表达式可能漏掉部分有效合约。
+
+\subsection{\code{_clean_points(rows,spot,trade_date)}}
+
+\paragraph{数学流程}
+对每条合约：
+\begin{enumerate}
+  \item 解析合约得到 \(K\)、expiry；
+  \item 计算期限：
+  \[
+  \tau=\frac{\text{expiry}-\text{trade date}}{365};
+  \]
+  \item 过滤：
+  \[
+  \frac7{365}\le \tau\le 2.25;
+  \]
+  \item 读取 IV，并过滤：
+  \[
+  0.03\le \sigma_{\mathrm{imp}}\le 1.2;
+  \]
+  \item 过滤 moneyness：
+  \[
+  0.65\le \frac K{S_0}\le 1.45;
+  \]
+  \item 对相同 \((K,\tau)\) 的多条 IV 取中位数。
+\end{enumerate}
+
+\paragraph{正确性}
+过滤 0、极端 IV 和太远行权价是合理的数据清洗。call/put 同点取中位数可以降低个别异常点影响。
+
+\paragraph{风险}
+\begin{itemize}
+  \item 期限用自然日除以 365，未考虑交易日历、实际到期顺延、日内剩余时间。
+  \item IV 过滤阈值是经验值，不是无套利检验。
+  \item 同一 \((K,T)\) 的 call 与 put IV 理论上应接近，但实际受买卖价、分红、利率、流动性影响。简单中位数不能替代完整报价清洗。
+\end{itemize}
+
+\subsection{\code{_grid_surface(points,spot)}}
+
+\paragraph{数学流程}
+将清洗后的散点：
+\[
+(K_\ell,T_\ell,\sigma_\ell),\qquad \ell=1,\ldots,L
+\]
+插到规则网格：
+\[
+K_i=S_0\times
+\{0.7,0.8,0.9,0.97,1.0,1.03,1.1,1.2,1.35\},
+\]
+\[
+T_j\in\left\{\frac1{12},0.25,0.5,0.75,1.0,1.5,2.0\right\}
+\]
+中位于原始期限范围内的节点。
+
+对每个目标点 \((K_i,T_j)\)，计算尺度化距离：
+\[
+d_\ell^2
+=
+\left(\frac{K_\ell-K_i}{0.08S_0}\right)^2
++
+\left(\frac{T_\ell-T_j}{0.35}\right)^2.
+\]
+取最近若干点，用权重：
+\[
+w_\ell=\frac1{\max(d_\ell^2,10^{-6})}
+\]
+得到：
+\[
+\widehat\sigma_{ij}
+=
+\frac{\sum_{\ell\in \mathcal N}w_\ell\sigma_\ell}
+{\sum_{\ell\in \mathcal N}w_\ell}.
+\]
+
+\paragraph{正确性}
+反距离加权插值能生成平滑、直观的 IV 网格，适合 demo。
+
+\paragraph{风险}
+这不是金融意义上的无套利曲面构造。它没有保证：
+\[
+\partial_{KK}C\ge 0,\qquad
+\partial_TC \text{ 满足无日历套利约束}.
+\]
+因此后续 Dupire 可能出现负局部方差，代码只能 fallback 到 IV。
+
+\subsection{\code{load_sse_option_iv_surface(etf_key,spot)}}
+
+该函数串联：
+\[
+\text{rows}
+\rightarrow
+\text{clean points}
+\rightarrow
+\text{regular VolSurface}.
+\]
+数学上流程完整。主要问题仍是到期日规则、无套利插值和 \(r,q\) 一致性。
+
+\section{\code{demo_app.py} 中与数学有关的函数}
+
+\subsection{\code{surface_payload(surface,lv)}}
+
+该函数在固定 moneyness 网格：
+\[
+K/S_0\in[0.7,1.35]
+\]
+和若干期限上输出：
+\[
+\sigma_{\mathrm{imp}}(K,T),
+\qquad
+\sigma_{\mathrm{loc}}(K,T).
+\]
+它只用于可视化，不影响定价结果。若 \(\sigma_{\mathrm{loc}}\) 出现异常，该图能帮助诊断 Dupire 曲面问题。
+
+\subsection{\code{_float}, \code{_int}, \code{_bool}, \code{_choice}}
+
+这些函数把 URL query string 转成数值或枚举。数学上属于参数解析。风险是缺少区间校验，例如用户可传入 \(K_{\mathrm{KI}}>K_{\mathrm{KO}}\)、负名义本金等异常参数；当前 UI 输入框限制了一部分，但 API 层没有完整验证。
+
+\subsection{\code{DemoHandler._price(qs)}}
+
+\paragraph{数学流程}
+\begin{enumerate}
+  \item 读取市场快照：
+  \[
+  S_0,\quad \widehat\sigma_{\mathrm{hist}},\quad \text{close history}.
+  \]
+  \item 默认使用：
+  \[
+  r=0.02,\qquad q=0.
+  \]
+  \item 若为 ETF 且可加载上交所 IV，则构造真实 IV 曲面；否则使用历史波动率锚定的 demo 曲面。
+  \item 构造 Dupire local vol：
+  \[
+  \sigma_{\mathrm{loc}}=\mathrm{Dupire}(\sigma_{\mathrm{imp}}).
+  \]
+  \item 构造雪雪球条款，使用 Monte Carlo 反解公允票息。
+  \item 额外用 PDE 计算一个 ATM 欧式看涨，用于展示和诊断。
+\end{enumerate}
+
+\paragraph{正确性}
+调用链与 README 描述一致，定价主线清楚。
+
+\paragraph{关键风险}
+\begin{enumerate}
+  \item 默认 \(q=0\)。ETF 与指数均可能有分红收益率。如果 \(q\) 偏低，forward 价格、Black-Scholes 价格曲面、Dupire 曲面都会受到系统影响。
+  \item 当真实 IV 加载失败时，系统退回 demo 曲面。此时页面仍会给出“公允票息”，但它不再是市场 IV 定价结果。
+  \item \code{par_result} 与 \code{quoted_result} 使用相同 seed 的路径，比较稳定；但如果用户把二者当作独立模拟结果，理解会有偏差。
+  \item \code{par_price} 理论上应接近 notional；若 fair coupon 被 clip，则可能不再严格等于 notional。
+\end{enumerate}
+
+\section{\code{tests/test_calibration.py}}
+
+\subsection{\code{ConstantLocalVol}}
+
+该测试类定义：
+\[
+\sigma_{\mathrm{loc}}(K,T)=\sigma.
+\]
+用于验证 MC 或 PDE 在常数波动率下的基础性质。数学上清晰。
+
+\subsection{\code{flat_surface(sigma)}}
+
+构造：
+\[
+\sigma_{\mathrm{imp}}(K,T)=\sigma.
+\]
+在 Black-Scholes 世界中，平坦 IV 对应常数 local vol。该函数是测试 Dupire 的标准基准。
+
+\subsection{\code{test_dupire_recovers_flat_vol}}
+
+检验：
+\[
+\sigma_{\mathrm{loc}}(K,T)\approx \sigma_{\mathrm{imp}}
+\]
+在若干 \(K,T\) 点成立。该测试能发现 Dupire 公式中 \(rK C_K\)、\(qC\)、\((r-q)KC_K\) 项的符号错误。当前通过，说明核心公式方向正确。
+
+\subsection{\code{test_pde_matches_black_scholes_for_flat_vol}}
+
+在常数波动率下，局部波动率 PDE 应退化为 Black-Scholes PDE。测试比较：
+\[
+V_{\mathrm{PDE}}\approx V_{\mathrm{BS}}.
+\]
+当前容忍误差 0.25，对 demo 网格而言合理。
+
+\subsection{\code{test_snowball_path_probabilities_are_exhaustive}}
+
+验证四类路径概率：
+\[
+P_{\mathrm{bonus}}+P_{\mathrm{noKI,KO}}+P_{\mathrm{KI,noKO}}+P_{\mathrm{KI,KO}}=1.
+\]
+同时验证：
+\[
+P_{\mathrm{KI}}
+=
+P_{\mathrm{KI,noKO}}+P_{\mathrm{KI,KO}},
+\]
+\[
+P_{\mathrm{KO}}
+=
+P_{\mathrm{noKI,KO}}+P_{\mathrm{KI,KO}}.
+\]
+这是路径分类正确性的必要条件。
+
+\subsection{\code{test_lockout_reduces_early_knockout_probability}}
+
+检验锁定期增加后：
+\[
+P_{\mathrm{KO}}^{\mathrm{locked}}
+\le
+P_{\mathrm{KO}}^{\mathrm{base}}.
+\]
+这符合经济直觉。注意该测试没有验证锁定期边界日是否与真实合同一致。
+
+\section{最重要的数学与实现风险排序}
+
+\subsection{P0: ETF 期权到期日规则错误}
+
+\code{_last_wednesday} 应优先修正。该问题不是数值近似，而是合约日期定义错误。修正后应增加单元测试，例如：
+\[
+\text{2026-09}\mapsto 2026\text{-}09\text{-}23
+\]
+而不是 2026-09-30。
+
+\subsection{P1: IV 曲面无套利约束缺失}
+
+Dupire 对曲面质量非常敏感。建议至少增加诊断：
+\[
+C_{KK}(K,T)>0,
+\qquad
+\sigma_{\mathrm{loc}}^2(K,T)>0
+\]
+的网格比例统计。如果大量点 fallback 到 IV，应在 UI 中提示该曲面不适合解释为严格 Dupire local vol。
+
+\subsection{P1: 分红率 \(q\) 默认设为 0}
+
+对于 ETF 和权益指数，\(q=0\) 通常不是严格假设。若使用真实 IV，应尽量使用一致的 forward、分红率或从期权平价反推出 \(F_T\)。否则 Dupire 中：
+\[
+qC+(r-q)KC_K
+\]
+会系统偏差。
+
+\subsection{P2: 雪雪球合同细节简化}
+
+当前 payoff 是合理的基础模板，但真实产品可能有：
+\begin{itemize}
+  \item 具体观察日历；
+  \item 锁定期后首个观察日定义；
+  \item 降敲是否从首月累计；
+  \item 票息按整期支付还是实际天数；
+  \item 敲入后敲出的票息规则；
+  \item 参与率、保证收益、红利票息或记忆票息。
+\end{itemize}
+若用于具体产品，应先把 term sheet 映射成代码参数和现金流规则。
+
+\subsection{P2: Monte Carlo 模型风险}
+
+Local volatility 能拟合 vanilla option 的边际分布，但对障碍产品的路径性质不一定稳健。实际交易中通常会比较：
+\[
+\text{local vol},\quad \text{stochastic vol},\quad \text{jump/local stochastic vol}
+\]
+下的敲入敲出概率差异。
+
+\section{建议补充的测试}
+
+\begin{enumerate}
+  \item 到期日测试：验证上交所 ETF 期权月份的第四个星期三规则，尤其是有 5 个星期三的月份。
+  \item Dupire 诊断测试：在真实缓存 IV 曲面上统计局部方差为正的比例、fallback 比例、ATM local vol 范围。
+  \item MC 鞅测试：在常数波动率下验证
+  \[
+  \mathbb E[e^{-(r-q)t}S_t]\approx S_0
+  \]
+  或等价的 forward 一致性。若考虑分红，需明确检验对象。
+  \item 简单雪雪球边界测试：若 \(B_{\mathrm{KO}}\) 极低且首日可观察，敲出概率应接近 1；若 \(B_{\mathrm{KI}}\) 极低，敲入概率应接近 0。
+  \item fair coupon 未裁剪测试：返回未裁剪 \(c^\ast\)，并验证
+  \[
+  \widehat{PV}(c^\ast)=N_0
+  \]
+  在数值误差内成立。
+  \item PDE put-call parity 测试：同一 local vol 下欧式 call/put 应满足数值版 parity，至少在平坦波动率下严格检查。
+\end{enumerate}
+
+\section{最终结论}
+
+代码的核心数学框架是成立的：从 implied volatility 生成 Black-Scholes call price surface，再用 Dupire 公式得到 local volatility，并分别用 PDE 和 Monte Carlo 定价，这是标准风险中性定价路线。主要公式没有发现方向性错误。
+
+但若问题是“能否作为严肃交易定价器”，答案应谨慎。当前最需要修正的是 ETF 期权到期日规则；最需要补强的是 IV 曲面的无套利处理、分红率/forward 一致性，以及雪雪球合同日历和现金流细节。修正这些问题后，现有框架才更接近可解释、可追问、可复现实盘定价原型。
+
+\end{document}

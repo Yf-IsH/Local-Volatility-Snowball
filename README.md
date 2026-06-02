@@ -9,7 +9,18 @@ This project demonstrates how a local volatility model can be used to quote the 
 - Converts the IV surface into a local volatility surface with the Dupire formula.
 - Simulates snowball paths with local volatility Monte Carlo.
 - Solves the fair annual coupon from `PV(coupon) = notional`.
-- Shows interactive 3D IV/local-vol surfaces, path outcome probabilities, and a detailed math derivation in the browser.
+- Shows an interactive pricing workbench with IV/local-vol surfaces, path outcome probabilities, model diagnostics, cash-flow details, and a lecture-style math derivation in the browser.
+
+## Recent Updates
+
+- Corrected SSE ETF option expiry parsing from "last Wednesday" to the official "fourth Wednesday of the expiry month" convention.
+- Added Dupire diagnostics for positive density, positive numerator, fallback ratio, and local-volatility range.
+- Improved Monte Carlo pricing by reusing simulated payoff components for both fair coupon and quoted coupon valuation.
+- Added unclipped fair coupon output so extreme or invalid quotes are visible instead of silently hidden by display clipping.
+- Reworked the browser demo into a more usable pricing workbench with grouped inputs, result cards, risk probabilities, market data, surface views, detailed cash-flow components, and model notes.
+- Expanded the model explanation tab into a longer lecture-style derivation without relying on external MathJax/CDN resources.
+- Added a detailed mathematical review document at `docs/local_vol_pricer_math_review.tex`.
+- Added regression tests for Dupire diagnostics, SSE ETF expiry parsing, and fair-coupon consistency.
 
 ## Environment Setup
 
@@ -86,6 +97,39 @@ If the port is already in use, the app automatically tries the next available po
 
 For ETF underlyings, option IV comes from the SSE option risk indicator field `IMPLC_VOLATLTY`. The app filters zero or extreme IV values and interpolates the remaining contract points into a regular IV surface.
 
+SSE ETF option expiry dates are parsed using the fourth Wednesday of the expiry month. If a production deployment needs full holiday handling, the next step is to connect an exchange trading calendar and roll holidays or market-closure days according to the official rule.
+
 For broad indices such as CSI 500 and CSI 1000, the app still uses a demo IV surface generated from historical realized volatility. A production-grade version should connect to CFFEX index option chains and imply IV from option prices.
 
 Runtime market data cache files are stored under `data/cache/` and are ignored by Git.
+
+## Model Notes
+
+The pricing engine treats the option-implied volatility surface as the primary market input. It first converts implied volatilities into discounted Black-Scholes call prices, then applies the Dupire relation to infer a local volatility surface:
+
+```text
+sigma_local^2(K,T) = (dC/dT + q C + (r - q) K dC/dK) / (0.5 K^2 d2C/dK2)
+```
+
+The snowball payoff is path dependent, so the final coupon valuation is handled by Monte Carlo simulation under the local-volatility dynamics:
+
+```text
+dS_t / S_t = (r - q) dt + sigma_local(S_t,t) dW_t
+```
+
+The app reports both the fair annual coupon and the quoted-coupon present value. It also reports knock-out, knock-in, knock-in-without-knock-out, and no-knock-in/no-knock-out probabilities so the result can be reviewed beyond a single coupon number.
+
+## Validation
+
+Run the test suite with:
+
+```powershell
+python -m pytest tests -q
+```
+
+Current regression coverage checks:
+
+- calibration sanity for the IV surface,
+- Dupire diagnostics on a flat volatility surface,
+- SSE ETF fourth-Wednesday expiry parsing,
+- fair-coupon consistency when the solved coupon is priced back into the product.

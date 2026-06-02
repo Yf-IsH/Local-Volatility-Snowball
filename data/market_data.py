@@ -114,12 +114,12 @@ def _fetch_eastmoney(index_key: str, lookback_days: int):
     session = requests.Session()
     session.trust_env = False
     last_error = None
-    for _ in range(3):
+    for _ in range(1):
         try:
             response = session.get(
                 "https://push2his.eastmoney.com/api/qt/stock/kline/get",
                 params=params,
-                timeout=10,
+                timeout=1,
                 headers={"User-Agent": "Mozilla/5.0"},
             )
             response.raise_for_status()

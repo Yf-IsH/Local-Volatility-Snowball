@@ -50,7 +50,7 @@ def _request_sse_risk(trade_date: date):
     response = session.get(
         "http://query.sse.com.cn/commonQuery.do",
         params=params,
-        timeout=10,
+        timeout=1,
         headers={"Referer": "http://www.sse.com.cn/", "User-Agent": "Mozilla/5.0"},
     )
     response.raise_for_status()
@@ -85,7 +85,7 @@ def load_sse_option_rows(etf_key: str):
         raise ValueError(f"{etf_key} has no SSE ETF option IV source")
 
     prefix = ETF_OPTION_UNIVERSE[etf_key]["option_prefix"]
-    for dt in _previous_dates():
+    for dt in _previous_dates(2):
         try:
             rows = _request_sse_risk(dt)
             rows = [row for row in rows if str(row.get("CONTRACT_ID", "")).startswith(prefix)]
@@ -100,14 +100,17 @@ def load_sse_option_rows(etf_key: str):
     return rows, trade_date, "本地缓存：上交所期权风险指标"
 
 
-def _last_wednesday(year: int, month: int):
-    if month == 12:
-        d = date(year + 1, 1, 1) - timedelta(days=1)
-    else:
-        d = date(year, month + 1, 1) - timedelta(days=1)
+def _fourth_wednesday(year: int, month: int):
+    """SSE ETF option expiry before holiday adjustment.
+
+    SSE stock option contracts expire on the fourth Wednesday of the expiry
+    month, with exchange holidays handled by official trading calendars. This
+    demo does not ship a holiday calendar, so it applies the base weekday rule.
+    """
+    d = date(year, month, 1)
     while d.weekday() != 2:
-        d -= timedelta(days=1)
-    return d
+        d += timedelta(days=1)
+    return d + timedelta(days=21)
 
 
 def _parse_contract(contract_id: str):
@@ -118,7 +121,7 @@ def _parse_contract(contract_id: str):
     year = 2000 + int(yy)
     month = int(mm)
     strike = int(strike_raw) / 1000.0
-    expiry = _last_wednesday(year, month)
+    expiry = _fourth_wednesday(year, month)
     return cp, expiry, strike
 
 

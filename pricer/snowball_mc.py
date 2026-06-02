@@ -65,11 +65,18 @@ class SnowballMCPricer:
         principal_payoff = np.zeros(paths)
         coupon_accrual = np.zeros(paths)
         S = np.full(paths, S0, dtype=float)
-        lv_grid = np.linspace(0.35 * S0, 2.2 * S0, 90)
+        lv_grid = np.linspace(0.35 * S0, 2.2 * S0, 48)
+        lv_time_count = min(total_steps, 64)
+        lv_time_grid = np.linspace(dt, terms.maturity_years, lv_time_count)
+        lv_time_indices = np.searchsorted(lv_time_grid, np.arange(1, total_steps + 1) * dt, side="left")
+        lv_time_indices = np.clip(lv_time_indices, 0, lv_time_count - 1)
+        lv_by_time = np.empty((lv_time_count, len(lv_grid)))
+        for idx, tau in enumerate(lv_time_grid):
+            lv_by_time[idx] = [self.lv_pricer.local_vol(x, tau) for x in lv_grid]
 
         for step in range(1, total_steps + 1):
             tau = step * dt
-            grid_sigmas = np.array([self.lv_pricer.local_vol(x, tau) for x in lv_grid])
+            grid_sigmas = lv_by_time[lv_time_indices[step - 1]]
             sigmas = np.interp(np.clip(S, lv_grid[0], lv_grid[-1]), lv_grid, grid_sigmas)
             z = rng.standard_normal(paths)
             S *= np.exp((self.r - self.q - 0.5 * sigmas**2) * dt + sigmas * np.sqrt(dt) * z)
@@ -138,8 +145,9 @@ class SnowballMCPricer:
             "terminal_mean": float(np.mean(components["terminal"])),
         }
 
-    def price(self, S0: float, terms: SnowballTerms, paths: int = 8000) -> Dict[str, float]:
-        components = self._simulate_components(S0, terms, paths)
+    def price(self, S0: float, terms: SnowballTerms, paths: int = 8000, components=None) -> Dict[str, float]:
+        if components is None:
+            components = self._simulate_components(S0, terms, paths)
         pv = components["principal_pv"] + terms.coupon * components["coupon_annuity_pv"]
         return self._summary(components, pv)
 
@@ -150,15 +158,20 @@ class SnowballMCPricer:
         notional = E[discounted principal payoff] + coupon * E[discounted accrual].
         """
         components = self._simulate_components(S0, terms, paths)
+        return self.fair_coupon_from_components(terms, components)
+
+    def fair_coupon_from_components(self, terms: SnowballTerms, components) -> Dict[str, float]:
         principal_pv = float(np.mean(components["principal_pv"]))
         coupon_annuity_pv = float(np.mean(components["coupon_annuity_pv"]))
-        coupon = (terms.notional - principal_pv) / coupon_annuity_pv if coupon_annuity_pv > 1e-12 else 0.0
-        coupon = float(np.clip(coupon, -1.0, 2.0))
+        raw_coupon = (terms.notional - principal_pv) / coupon_annuity_pv if coupon_annuity_pv > 1e-12 else 0.0
+        coupon = float(np.clip(raw_coupon, -1.0, 2.0))
         pv = components["principal_pv"] + coupon * components["coupon_annuity_pv"]
         summary = self._summary(components, pv)
         summary.update(
             {
                 "fair_coupon": coupon,
+                "unclipped_fair_coupon": float(raw_coupon),
+                "fair_coupon_clipped": bool(coupon != raw_coupon),
                 "principal_pv": principal_pv,
                 "coupon_annuity_pv": coupon_annuity_pv,
             }
