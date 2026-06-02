@@ -47,7 +47,7 @@ python -m pip install -r requirements.txt
 Run the demo:
 
 ```powershell
-python demo_app.py --port 8015
+python demo_app.py --port 8020
 ```
 
 Run tests:
@@ -74,7 +74,7 @@ python -m pip install -r requirements.txt
 Run the demo:
 
 ```powershell
-python demo_app.py --port 8015
+python demo_app.py --port 8020
 ```
 
 Run tests:
@@ -88,7 +88,7 @@ python -m pytest tests -v
 After starting the server, open:
 
 ```text
-http://127.0.0.1:8015
+http://127.0.0.1:8020
 ```
 
 If the port is already in use, the app automatically tries the next available port and prints the actual URL in the terminal.
@@ -105,7 +105,7 @@ Runtime market data cache files are stored under `data/cache/` and are ignored b
 
 ## Model Notes
 
-The pricing engine treats the option-implied volatility surface as the primary market input. It first converts implied volatilities into discounted Black-Scholes call prices, then applies the Dupire relation to infer a local volatility surface:
+The pricing engine treats option prices as the theoretical market object, while the app often receives or displays the same information in implied-volatility coordinates. In definition, implied volatility is obtained by solving the Black-Scholes equation from a market option price. In implementation, the app maps the available implied-volatility surface back into equivalent discounted Black-Scholes call prices, then applies the Dupire relation to infer a local volatility surface:
 
 ```text
 sigma_local^2(K,T) = (dC/dT + q C + (r - q) K dC/dK) / (0.5 K^2 d2C/dK2)

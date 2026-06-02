@@ -1212,12 +1212,20 @@ HTML = r"""<!doctype html>
             </div>
             <p>这里的 Q 表示风险中性测度。注意，这不是用历史收益率预测未来，而是在无套利框架下用市场期权价格隐含出的分布来定价。</p>
 
-            <h3>2. 从隐含波动率到欧式期权价格曲面</h3>
-            <p>市场上观察到的通常不是局部波动率，而是不同执行价 K、不同到期 T 的 vanilla option 隐含波动率。代码先把隐含波动率曲面记为：</p>
+            <h3>2. 市场价格、隐含波动率与 Dupire 输入</h3>
+            <p>严格地说，隐含波动率不是原始定义上的市场价格。原始对象是每个执行价 K、到期 T 的 vanilla option 市场价格 C<sub>mkt</sub>(K,T)。所谓隐含波动率，是把这个市场价格代入带连续分红率的 Black-Scholes 公式后，反解出来的那个常数波动率：</p>
+            <div class="formula">
+              C<sub>mkt</sub>(K,T) = BS(S<sub>0</sub>, K, T, r, q, σ<sub>imp</sub>)
+            </div>
+            <p>因此，从概念定义上讲，方向是：</p>
+            <div class="formula">
+              C<sub>mkt</sub>(K,T) → 反解 Black-Scholes → σ<sub>imp</sub>(K,T)
+            </div>
+            <p>本项目页面和交易所期权风险指标里经常直接拿到的是 IV 字段，所以代码把已经得到的隐含波动率曲面记为：</p>
             <div class="formula">
               σ<sub>imp</sub> = σ<sub>imp</sub>(K, T)
             </div>
-            <p>然后用带连续分红率的 Black-Scholes 公式把它转成看涨期权价格曲面 C(K,T)：</p>
+            <p>但 Dupire 公式本身需要的是欧式看涨期权价格曲面及其偏导数，而不是 IV 对 K、T 的偏导数。于是工程实现会把 IV 重新代入同一个 Black-Scholes 映射，恢复出与该 IV 等价的看涨期权价格曲面 C(K,T)：</p>
             <div class="formula">
               C(K,T) = S<sub>0</sub> exp(-qT) N(d<sub>1</sub>) - K exp(-rT) N(d<sub>2</sub>)
             </div>
@@ -1226,7 +1234,11 @@ HTML = r"""<!doctype html>
               <span class="frac"><span>ln(S<sub>0</sub>/K) + (r - q + 0.5 σ<sub>imp</sub><sup>2</sup>)T</span><span>σ<sub>imp</sub> √T</span></span>,
               &nbsp; d<sub>2</sub> = d<sub>1</sub> - σ<sub>imp</sub> √T
             </div>
-            <p>这一步的含义是：隐含波动率只是 Black-Scholes 公式中的一个等价参数，真正进入 Dupire 公式的是价格曲面 C(K,T)，不是 IV 本身。</p>
+            <p>这一步不是在定义隐含波动率，而是在把“以 IV 形式保存的市场信息”转回 Dupire 所需的价格坐标。更准确的链条是：</p>
+            <div class="formula">
+              C<sub>mkt</sub>(K,T) ↔ σ<sub>imp</sub>(K,T) → C(K,T) → ∂<sub>T</sub>C, ∂<sub>K</sub>C, ∂<sub>KK</sub>C → σ<sub>loc</sub>(K,T)
+            </div>
+            <p>其中第一个双向箭头表示：在给定 S<sub>0</sub>、K、T、r、q 后，只要期权价格没有违反基本无套利边界，价格和 Black-Scholes 隐含波动率可以互相转换。真正进入 Dupire 公式的是价格曲面 C(K,T)，IV 只是市场价格曲面的另一种报价方式。</p>
             <div class="callout">如果 IV 曲面插值不稳定或不满足无套利约束，C(K,T) 关于 K 的凸性可能被破坏，后面的 Dupire 局部波动率就会出现负方差或 fallback。</div>
 
             <h3>3. Dupire 公式：为什么能从 C(K,T) 得到局部波动率</h3>
@@ -1895,7 +1907,7 @@ class DemoHandler(BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8010)
+    parser.add_argument("--port", type=int, default=8020)
     args = parser.parse_args()
 
     host = args.host
